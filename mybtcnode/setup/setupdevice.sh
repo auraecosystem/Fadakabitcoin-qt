@@ -1,0 +1,1186 @@
+#!/bin/bash
+
+###
+### Setup MyNode (all devices)
+### Run with "sudo"
+###
+
+set -x
+set -e
+
+if [ "$#" != "1" ]; then
+    echo "Usage: $0 <ip address | online>"
+    exit 1
+fi
+SERVER_IP=$1
+
+# Determine Device
+IS_ARMBIAN=0
+IS_ROCK64=0
+IS_ROCKPRO64=0
+IS_RASPI=0
+IS_RASPI3=0
+IS_RASPI4=0
+IS_RASPI5=0
+IS_ROCKPI4=0
+IS_X86=0
+IS_ARM64=0
+IS_32_BIT=0
+IS_64_BIT=0
+IS_UNKNOWN=0
+DEVICE_TYPE="unknown"
+MODEL=$(cat /proc/device-tree/model) || IS_UNKNOWN=1
+# Minimal Debian installs do not include lsb_release
+if ! command -v lsb_release > /dev/null; then
+    apt-get update
+    apt-get -y install lsb-release
+fi
+DEBIAN_CODENAME=$(lsb_release -c -s) || DEBIAN_CODENAME="unknown"
+uname -a | grep -E 'amd64|x86_64' && IS_X86=1 && IS_64_BIT=1 && IS_UNKNOWN=0 || true
+if [[ $MODEL == *"Rock64"* ]]; then
+    IS_ARMBIAN=1
+    IS_ROCK64=1
+    IS_64_BIT=1
+elif [[ $MODEL == *"RockPro64"* ]]; then
+    IS_ARMBIAN=1
+    IS_ROCKPRO64=1
+    IS_64_BIT=1
+elif [[ $MODEL == *"Raspberry Pi 3"* ]]; then
+    IS_RASPI=1
+    IS_RASPI3=1
+    IS_32_BIT=1
+elif [[ $MODEL == *"Raspberry Pi 4"* ]]; then
+    IS_RASPI=1
+    IS_RASPI4=1
+    IS_32_BIT=1
+    UNAME=$(uname -a)
+    if [[ $UNAME == *"aarch64"* ]]; then
+        IS_ARM64=1
+        IS_32_BIT=0
+        IS_64_BIT=1
+    fi
+elif [[ $MODEL == *"Raspberry Pi 5"* || $MODEL == *"Raspberry Pi Compute Module 5"* ]]; then
+    IS_RASPI=1
+    IS_RASPI5=1
+    IS_ARM64=1
+    IS_64_BIT=1
+elif [[ $MODEL == *"ROCK Pi 4"* ]]; then
+    IS_ARMBIAN=1
+    IS_ROCKPI4=1
+    IS_64_BIT=1
+fi
+
+
+if [ $IS_UNKNOWN = 1 ]; then
+    echo "UNKNOWN DEVICE TYPE"
+    exit 1
+fi
+
+# Set kernel settings
+sysctl -w net.ipv6.conf.all.disable_ipv6=1
+sysctl -w net.ipv6.conf.default.disable_ipv6=1
+sysctl -w net.ipv6.conf.lo.disable_ipv6=1
+
+# Set DNS for install (old)
+#echo "" > /etc/resolv.conf
+#echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+#echo "nameserver 9.9.9.9" >> /etc/resolv.conf
+#echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+
+# Set DNS for install (new)
+echo "" >> /etc/dhcp/dhclient.conf
+echo "append domain-name-servers 1.1.1.1, 208.67.222.222, 8.8.8.8;" >> /etc/dhcp/dhclient.conf
+dhclient -r
+
+# Test DNS resolution issues (may have only seen issues on bad device)
+#ping -c 2 raspberrypi.org
+#ping -c 2 raspbian.raspberrypi.org
+#ping -c 2 pythonhosted.org
+#ping -c 2 python.org
+#ping -c 2 piwheels.org
+
+
+# Make sure FS is expanded
+if [ $IS_ARMBIAN = 1 ] ; then
+    /usr/lib/armbian/armbian-resize-filesystem start
+fi
+if [ $IS_X86 = 1 ]; then
+    apt-get -y install gdisk parted
+
+    X86_ROOT_PARTITION="$(mount | grep ' / ' | cut -d ' ' -f1)"
+    X86_DEVICE="$(lsblk -no pkname $X86_ROOT_PARTITION)"
+    X86_DEVICE_PATH="/dev/$X86_DEVICE"
+    case "$X86_DEVICE" in
+        sd* | hd* | vd*)
+            # SATA
+            X86_PARTITION_NUMBER=$(cat /proc/partitions | grep -c "${X86_DEVICE}[0-9]")
+            ;;
+        nvme*)
+            # NVMe
+            X86_PARTITION_NUMBER=$(cat /proc/partitions | grep -c "${X86_DEVICE}p[0-9]")
+            ;;            
+    esac    
+    X86_FDISK_TYPE=$(fdisk -l "$X86_DEVICE_PATH" | grep "Disklabel")
+    echo "Root Partition:   $X86_ROOT_PARTITION"
+    echo "Root Device:      $X86_DEVICE"
+    echo "Root Dev Path:    $X86_DEVICE_PATH"
+    echo "Root Partition #: $X86_PARTITION_NUMBER"
+    if [[ "$X86_FDISK_TYPE" = *"Disklabel type: gpt"* ]]; then
+        if [ "$X86_PARTITION_NUMBER" = "2" ]; then
+            sgdisk -e $X86_DEVICE_PATH
+            sgdisk -d $X86_PARTITION_NUMBER $X86_DEVICE_PATH
+            sgdisk -N $X86_PARTITION_NUMBER $X86_DEVICE_PATH
+            partprobe $X86_DEVICE_PATH
+            resize2fs $X86_ROOT_PARTITION
+        else
+            echo "Not resizing - Expected 2 partitions, found $X86_PARTITION_NUMBER"
+        fi
+    else
+        echo "Not resizing - Expected GPT partition"
+        echo "$X86_FDISK"
+    fi
+fi
+
+
+# Download rootfs
+rm -rf /tmp/rootfs.tar.gz
+rm -rf /tmp/upgrade/
+mkdir -p /tmp/upgrade
+
+TARBALL=""
+if [ $IS_ROCK64 = 1 ]; then
+    TARBALL="mynode_rootfs_rock64.tar.gz"
+elif [ $IS_ROCKPRO64 = 1 ]; then
+    TARBALL="mynode_rootfs_rockpro64.tar.gz"
+elif [ $IS_RASPI3 = 1 ]; then
+    TARBALL="mynode_rootfs_raspi3.tar.gz"
+elif [ $IS_RASPI4 = 1 ]; then
+    TARBALL="mynode_rootfs_raspi4.tar.gz"
+elif [ $IS_RASPI5 = 1 ]; then
+    TARBALL="mynode_rootfs_raspi5.tar.gz"
+elif [ $IS_ROCKPI4 = 1 ]; then
+    TARBALL="mynode_rootfs_rockpi4.tar.gz"
+elif [ $IS_X86 = 1 ]; then
+    TARBALL="mynode_rootfs_debian.tar.gz"
+fi
+if [ "$SERVER_IP" == "online" ]; then
+    RELEASE_TYPE="${TARBALL#mynode_rootfs_}"
+    RELEASE_TYPE="${RELEASE_TYPE%.tar.gz}"
+    RELEASE_URL="https://www.mynodebtc.com/device_api/download_latest_standard.php?type=${RELEASE_TYPE}&product_key=community_edition"
+    wget "${RELEASE_URL}" -O /tmp/rootfs.tar.gz
+    wget "${RELEASE_URL}&hash=1" -O /tmp/rootfs.tar.gz.sha256
+
+    # Verify release signature
+    cat > /tmp/mynode_release.pub << 'EOF'
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApzQyKOKNBEhKWf1mJtqw
+qSLzSkMACMF0Zz0rr2UT7MnxTfHpVYLJEwBfIxCAqys8AGHWAQNalG8+UzmrsuWl
+yAGo+rqKiSKUQ5NmthC5B49eL26Tie4jwK9hbLmHlzbxP+/1gqwWFM9ZlozbtTW3
+LGzvT7evXdMOqCoVojJWCkCdKaWuXkCxlUQxs9wuMNdskKyA7ohifmHwS4DlkcZR
+PaiUcgXugMOrLwTuYvnmMG1Z4EA7UuFujX2jryKblo61VMZjo369RIZhdCWUJMdn
+vXkYNq4HtHk2hn3sdTIAWCfZ0+qoyhBI5DXn1Yh/zwCT0YwHPD/woP/my1zmIw6H
+uQIDAQAB
+-----END PUBLIC KEY-----
+EOF
+    openssl dgst -sha256 -verify /tmp/mynode_release.pub -signature /tmp/rootfs.tar.gz.sha256 /tmp/rootfs.tar.gz
+else
+    wget http://${SERVER_IP}:8000/${TARBALL} -O /tmp/rootfs.tar.gz
+fi
+
+# Extract rootfs (so we can reference temporary files)
+tar -xvf /tmp/rootfs.tar.gz -C /tmp/upgrade/
+TMP_INSTALL_PATH="/tmp/upgrade/out/rootfs_*"
+
+# Setup some dependencies
+mkdir -p /usr/share/mynode/
+cp -f /tmp/upgrade/out/rootfs_*/usr/share/mynode/mynode_device_info.sh /usr/share/mynode/mynode_device_info.sh
+cp -f /tmp/upgrade/out/rootfs_*/usr/share/mynode/mynode_config.sh /usr/share/mynode/mynode_config.sh
+cp -f /tmp/upgrade/out/rootfs_*/usr/share/mynode/mynode_functions.sh /usr/share/mynode/mynode_functions.sh
+cp -f /tmp/upgrade/out/rootfs_*/usr/bin/mynode-get-device-serial /usr/bin/mynode-get-device-serial
+
+# Source file containing app versions
+source /tmp/upgrade/out/rootfs_*/usr/share/mynode/mynode_app_versions.sh
+
+# Update SD card
+mkdir -p /etc/torrc.d
+
+# Set admin password to bolt
+useradd -p $(openssl passwd -1 bolt) -m -s /bin/bash admin || true
+
+# Initialize Users
+/bin/bash $TMP_INSTALL_PATH/usr/bin/mynode_initialize_users.sh
+
+# Setup bitcoin user folders
+mkdir -p /home/bitcoin/.mynode/
+chown bitcoin:bitcoin /home/bitcoin
+chown -R bitcoin:bitcoin /home/bitcoin/.mynode/
+
+# Update host info
+echo "mynode" > /etc/hostname
+sed -i 's/rock64/mynode/g' /etc/hosts
+sed -i 's/rockpi4-b/mynode/g' /etc/hosts
+
+# Update sources
+export DEBIAN_FRONTEND=noninteractive
+apt-get -y update --allow-releaseinfo-change
+
+# Add sources
+apt-get -y install apt-transport-https curl gnupg ca-certificates
+# Tor (arm32 support was dropped)
+if [ $IS_64_BIT = 1 ]; then
+    grep -qxF "deb https://deb.torproject.org/torproject.org ${DEBIAN_CODENAME} main" /etc/apt/sources.list  || echo "deb https://deb.torproject.org/torproject.org ${DEBIAN_CODENAME} main" >> /etc/apt/sources.list
+    grep -qxF "deb-src https://deb.torproject.org/torproject.org ${DEBIAN_CODENAME} main" /etc/apt/sources.list  || echo "deb-src https://deb.torproject.org/torproject.org ${DEBIAN_CODENAME} main" >> /etc/apt/sources.list
+fi
+if [ "$DEBIAN_CODENAME" = "buster" ]; then
+    # Migrate buster repos to archive
+    sed -i 's|deb.debian.org/debian|archive.debian.org/debian|g' /etc/apt/sources.list
+
+    # Migrate old buster backports to archive
+    sed -i 's|deb.debian.org/debian buster-backports|archive.debian.org/debian buster-backports|g' /etc/apt/sources.list
+    # Add backports repo
+    grep -qxF "deb http://archive.debian.org/debian buster-backports main" /etc/apt/sources.list  || echo "deb http://archive.debian.org/debian buster-backports main" >> /etc/apt/sources.list
+fi
+# Add I2P Repo
+/bin/bash $TMP_INSTALL_PATH/usr/share/mynode/scripts/add_i2p_repo.sh
+
+# Import Keys
+curl https://keybase.io/roasbeef/pgp_keys.asc | gpg --import
+curl https://keybase.io/bitconner/pgp_keys.asc | gpg --import
+curl https://keybase.io/guggero/pgp_keys.asc | gpg --import # Pool
+curl https://raw.githubusercontent.com/JoinMarket-Org/joinmarket-clientserver/refs/heads/master/pubkeys/AdamGibson-LOST-Aug-2024.asc | gpg --import # JoinMarket
+gpg --keyserver hkp://keyserver.ubuntu.com --recv-keys 01EA5486DE18A882D4C2684590C8019E36C2E964
+gpg --keyserver hkp://keyserver.ubuntu.com --recv-keys E777299FC265DD04793070EB944D35F9AC3DB76A # Bitcoin - Michael Ford (fanquake)
+curl https://keybase.io/suheb/pgp_keys.asc | gpg --import
+gpg --keyserver hkp://keyserver.ubuntu.com --recv-keys DE23E73BFA8A0AD5587D2FCDE80D2F3F311FD87E # Loop (abosworth)
+gpg --keyserver hkp://keyserver.ubuntu.com --recv-keys 9FC6B0BFD597A94DBF09708280E5375C094198D8 # Loop (bhandras)
+gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys 26984CB69EB8C4A26196F7A4D7D916376026F177 # Lightning Terminal
+gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys 187F6ADD93AE3B0CF335AA6AB984570980684DCC # Lightning Terminal
+gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys C20A78516A0944900EBFCA29961CC8259AE675D4 # Lightning Terminal (Viktor)
+gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys 3E9BD4436C288039CA827A9200C9E2BC2E45666F # RTL (Suheb)
+wget -q https://deb.torproject.org/torproject.org/A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89.asc -O- | apt-key add - # Tor
+gpg --keyserver hkp://keyserver.ubuntu.com --recv-keys 648ACFD622F3D138     # Debian Backports
+gpg --keyserver hkp://keyserver.ubuntu.com --recv-keys 0E98404D386FA1D9     # Debian Backports
+apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 66F6C87B98EBCFE2   # I2P (R4SAS)
+
+# Update OS
+apt -y update # Needed to accept new repos
+apt-get -y update
+
+# Freeze any packages we don't want to update
+if [ $IS_X86 = 1 ]; then
+    apt-mark hold grub*
+fi
+#apt-mark hold redis-server
+
+# Upgrade packages
+# full-upgrade (not upgrade --with-new-pkgs like mynode_post_upgrade.sh) since
+# this only runs once at image-build time, where it's safe to remove packages
+apt-get -y full-upgrade
+
+# Install other tools (run section multiple times to make sure success)
+apt-get -y install apt-transport-https lsb-release
+apt-get -y install htop git curl bash-completion jq dphys-swapfile lsof libzmq3-dev
+apt-get -y install build-essential python3-dev python3-pip python3-grpcio
+apt-get -y install fail2ban ufw tclsh redis-server
+# Use journald for the fail2ban sshd jail (no auth.log without rsyslog on Debian 12+)
+if [ "$DEBIAN_VERSION" -ge "12" ]; then
+    apt-get -y install python3-systemd
+    mkdir -p /etc/fail2ban/jail.d
+    printf "[sshd]\nbackend = systemd\njournalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd\n" > /etc/fail2ban/jail.d/mynode_sshd.conf
+fi
+apt-get -y install clang hitch zlib1g-dev libffi-dev file toilet ncdu
+apt-get -y install toilet-fonts avahi-daemon figlet
+apt-get -y install inotify-tools libssl-dev tor tmux screen fonts-dejavu
+apt-get -y install pv sysstat network-manager rsync parted unzip pkg-config
+apt-get -y install libfreetype6-dev libpng-dev libatlas-base-dev libgmp-dev libltdl-dev
+apt-get -y install libffi-dev libssl-dev python3-bottle automake libtool libltdl7
+apt -y -qq install apt-transport-https ca-certificates
+apt-get -y install libevent-dev ncurses-dev
+apt-get -y install zlib1g-dev libudev-dev libusb-1.0-0-dev python3-venv gunicorn
+apt-get -y install sqlite3 libsqlite3-dev torsocks python3-requests libsystemd-dev
+apt-get -y install unattended-upgrades
+apt-get -y install libjpeg-dev zlib1g-dev psmisc hexyl libbz2-dev liblzma-dev netcat-openbsd
+apt-get -y install hdparm iotop nut obfs4proxy libpq-dev socat btrfs-progs i2pd apparmor pass
+apt-get -y install gdisk xxd
+apt-get -y install cmake pkgconf libcurl4-openssl-dev libjansson-dev libmicrohttpd-dev libsodium-dev
+
+# Install Java
+apt-get -y install default-jre
+
+# Install packages dependent on Debian release
+if [ "$DEBIAN_CODENAME" == "bullseye" ]; then
+    apt-get -y install wireguard
+elif [ "$DEBIAN_CODENAME" == "bookworm" ]; then
+    apt-get -y install wireguard
+elif [ "$DEBIAN_CODENAME" == "buster" ]; then
+    apt-get -y -t buster-backports install wireguard
+else
+    echo "========================================="
+    echo "== UNKNOWN DEBIAN VERSION: $DEBIAN_CODENAME"
+    echo "== SOME APPS MAY NOT WORK PROPERLY"
+    echo "========================================="
+fi
+
+# Install Openbox GUI
+if [ $IS_X86 = 1 ]; then
+    apt-get -y install xorg chromium openbox lightdm
+fi
+
+# Install device specific packages
+if [ $IS_X86 = 1 ]; then
+    apt-get -y install cloud-init
+    apt-get -y install intel-microcode || true
+fi
+if [ $IS_ARMBIAN = 1 ] ; then
+    apt-get -y install systemd-timesyncd
+    timedatectl set-ntp true
+fi
+
+# Make sure some software is removed
+apt-get -y purge ntp # (conflicts with systemd-timedatectl)
+apt-get -y purge chrony # (conflicts with systemd-timedatectl)
+
+
+# Install other things without recommendation
+apt-get -y install --no-install-recommends expect
+apt-get -y install --no-install-recommends smartmontools nvme-cli
+# nvme-cli enables NVMe over Fabrics units MyNode doesn't use (they fail on kernels without nvme-fabrics)
+systemctl mask nvmf-autoconnect.service nvmf-connect@.service nvmefc-boot-connections.service > /dev/null 2>&1 || true
+# smartmontools enables the smartd daemon, which MyNode doesn't use (the SMART test runs smartctl). It fails
+# when no drive passes SMART through. The unit is smartmontools.service on Debian 12, smartd.service on 10.
+systemctl disable --now smartmontools.service smartd.service > /dev/null 2>&1 || true
+systemctl reset-failed smartmontools.service smartd.service > /dev/null 2>&1 || true
+
+
+# Install nginx
+mkdir -p /var/log/nginx
+apt-get -y install nginx || true
+apt-get -y install libnginx-mod-stream || true
+# Install may fail, so we need to edit the default config file and reconfigure
+rm -f /etc/nginx/modules-enabled/50-mod-* || true
+echo "" > /etc/nginx/sites-available/default
+dpkg --configure -a
+
+# Cleanup - Do another upgrade to pick up on anything added above, then cleanup
+apt-get -y full-upgrade
+apt-get -y autoremove
+apt-get clean
+
+# Update users
+usermod -a -G debian-tor bitcoin
+usermod -a -G debian-tor joinmarket
+usermod -a -G debian-tor admin
+
+# Make admin a member of bitcoin
+adduser admin bitcoin
+adduser joinmarket bitcoin
+
+
+# Install Go
+GO_ARCH="unknown"
+GO_SHA256=""
+if [ "$DEVICE_ARCH" == "armv7l" ]; then
+    GO_ARCH="armv6l"
+    GO_SHA256="$GO_ARMV6L_SHA256"
+elif [ "$DEVICE_ARCH" == "aarch64" ]; then
+    GO_ARCH="arm64"
+    GO_SHA256="$GO_ARM64_SHA256"
+elif [ "$DEVICE_ARCH" == "x86_64" ]; then
+    GO_ARCH="amd64"
+    GO_SHA256="$GO_AMD64_SHA256"
+fi
+GO_UPGRADE_URL=https://go.dev/dl/go$GO_VERSION.linux-$GO_ARCH.tar.gz
+CURRENT=""
+if [ -f $GO_VERSION_FILE ]; then
+    CURRENT=$(cat $GO_VERSION_FILE)
+fi
+if [ "$CURRENT" != "$GO_VERSION" ]; then
+    rm -rf /opt/download
+    mkdir -p /opt/download
+    cd /opt/download
+
+    wget $GO_UPGRADE_URL -O go.tar.gz
+    check_app_download go.tar.gz go $GO_VERSION "$GO_SHA256"
+    rm -rf /usr/local/go && tar -C /usr/local -xzf go.tar.gz
+
+    # Mark current version
+    echo $GO_VERSION > $GO_VERSION_FILE
+fi
+echo "export GOBIN=/usr/local/go/bin; PATH=\$PATH:/usr/local/go/bin" > /etc/profile.d/go.sh
+grep -qxF '. /etc/profile.d/go.sh' /root/.bashrc || echo '. /etc/profile.d/go.sh' >> /root/.bashrc
+
+
+# Install Rust (only needed on 32-bit RPi for building some python wheels)
+if [ ! -f $HOME/.cargo/env ]; then
+    wget https://sh.rustup.rs -O /tmp/setup_rust.sh
+    /bin/bash /tmp/setup_rust.sh -y --default-toolchain none
+    sync
+fi
+if [ -f $HOME/.cargo/env ]; then
+    # Remove old toolchains
+    source $HOME/.cargo/env
+    TOOLCHAINS=$(rustup toolchain list)
+    for toolchain in $TOOLCHAINS; do
+        if [[ "$toolchain" == *"linux"* ]] && [[ "$toolchain" != *"${RUST_VERSION}"* ]]; then
+            rustup toolchain remove $toolchain || true
+        fi
+    done
+    # Manage rust toolchains
+    if [ $IS_RASPI = 1 ] && [ $IS_ARM64 = 0 ]; then
+        # Install and use desired version
+        rustup install $RUST_VERSION
+        rustup default $RUST_VERSION
+        rustc --version
+    fi
+fi
+
+
+# Install Python3 (latest)
+CURRENT_PYTHON3_VERSION=$(python3 --version)
+if [[ "$CURRENT_PYTHON3_VERSION" != *"Python ${PYTHON_VERSION}"* ]]; then
+    mkdir -p /opt/download
+    cd /opt/download
+    rm -rf Python-*
+
+    wget https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz -O python.tar.xz
+    check_app_download python.tar.xz python $PYTHON_VERSION "$PYTHON_SHA256"
+    tar xf python.tar.xz
+
+    cd Python-*
+    ./configure
+    make -j4
+    make install
+    cd ~
+else
+    echo "Python up to date"
+fi
+
+# Add to python path
+[ -d /usr/local/lib/python2.7/dist-packages ] && echo "/var/pynode" > /usr/local/lib/python2.7/dist-packages/pynode.pth
+[ -d /usr/local/lib/python3.7/site-packages ] && echo "/var/pynode" > /usr/local/lib/python3.7/site-packages/pynode.pth
+[ -d /usr/local/lib/python3.8/site-packages ] && echo "/var/pynode" > /usr/local/lib/python3.8/site-packages/pynode.pth
+[ -d /usr/local/lib/python3.11/site-packages ] && echo "/var/pynode" > /usr/local/lib/python3.11/site-packages/pynode.pth
+
+
+# Install Python3 specific tools
+/usr/local/bin/python3 -m pip install pip==$PYTHON_PIP_VERSION setuptools==$PYTHON_SETUPTOOLS_VERSION wheel==$PYTHON_WHEEL_VERSION packaging==$PYTHON_PACKAGING_VERSION
+
+# PyYAML Workaround (maybe only needed for python 3.10+)
+#echo 'Cython < 3.0' > /tmp/constraint.txt
+#PIP_CONSTRAINT=/tmp/constraint.txt pip3 wheel PyYAML==5.4.1
+#pip3 install 'PyYAML==5.4.1'
+
+/usr/local/bin/python3 -m pip install -r $TMP_INSTALL_PATH/usr/share/mynode/mynode_pip3_requirements.txt --no-cache-dir
+
+# Install uv and the Python for apps with their own venv (64-bit only)
+if [ $IS_64_BIT = 1 ]; then
+    UV_ARCH="aarch64-unknown-linux-gnu"
+    UV_SHA256="$UV_AARCH64_SHA256"
+    if [ $IS_X86 = 1 ]; then
+        UV_ARCH="x86_64-unknown-linux-gnu"
+        UV_SHA256="$UV_X86_64_SHA256"
+    fi
+    CURRENT=""
+    if [ -f $UV_VERSION_FILE ]; then
+        CURRENT=$(cat $UV_VERSION_FILE)
+    fi
+    if [ "$CURRENT" != "$UV_VERSION" ] || [ ! -x /usr/local/bin/uv ]; then
+        rm -rf /opt/download
+        mkdir -p /opt/download
+        cd /opt/download
+        wget https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$UV_ARCH.tar.gz -O uv.tar.gz
+        check_app_download uv.tar.gz uv $UV_VERSION "$UV_SHA256"
+        tar -xf uv.tar.gz
+        install -m 0755 -o root -g root uv-$UV_ARCH/uv uv-$UV_ARCH/uvx /usr/local/bin/
+        echo $UV_VERSION > $UV_VERSION_FILE
+        cd ~
+    fi
+
+    # Remove other patch versions, so venvs (which use the minor version) run APP_PYTHON_VERSION
+    install -d -m 0755 -o root -g root /usr/local/lib/mynode
+    if $TMP_INSTALL_PATH/usr/bin/mynode-uv python install $APP_PYTHON_VERSION --no-bin; then
+        for dir in /usr/local/lib/mynode/python/cpython-$APP_PYTHON_MINOR_VERSION.*-linux-*; do
+            [ -d "$dir" ] || continue
+            ver=$(basename $dir | cut -d- -f2)
+            if [ "$ver" != "$APP_PYTHON_VERSION" ]; then
+                $TMP_INSTALL_PATH/usr/bin/mynode-uv python uninstall $ver || true
+            fi
+        done
+        # The venvs are built once MyNode's files are installed (below)
+    else
+        echo "WARNING: Failed to install Python $APP_PYTHON_VERSION for apps"
+    fi
+fi
+
+
+# Install node
+if [ ! -f /tmp/installed_node ]; then
+    install_nodesource_repo $NODE_JS_VERSION $(echo /tmp/upgrade/out/rootfs_*/usr/share/mynode/nodesource)
+    apt-get install -y nodejs
+    touch /tmp/installed_node
+fi
+
+# Install docker
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
+  $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+apt-get update --allow-releaseinfo-change
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || true
+
+# docker-compose is Compose v2 from docker-compose-plugin. The old pip Compose v1 fails to
+# recreate containers on current Docker. BTCPay's installer may already have put its own v2
+# binary there, which is left in place.
+COMPOSE_PLUGIN=/usr/libexec/docker/cli-plugins/docker-compose
+if ! /usr/local/bin/docker-compose version --short 2>/dev/null | grep -qE '^v?[2-9]'; then
+    # BTCPay's installer also replaces the plugin with a link to /usr/local/bin/docker-compose
+    if [ -L $COMPOSE_PLUGIN ]; then
+        rm -f $COMPOSE_PLUGIN
+        apt-get install -y --reinstall docker-compose-plugin || true
+    fi
+    if [ -f $COMPOSE_PLUGIN ]; then
+        /usr/local/bin/python3 -m pip uninstall -y docker-compose || true
+        ln -sf $COMPOSE_PLUGIN /usr/local/bin/docker-compose
+    fi
+fi
+
+# Use systemd for managing docker
+rm -f /etc/init.d/docker
+rm -f /etc/systemd/system/multi-user.target.wants/docker.service
+systemctl -f enable docker.service
+
+groupadd docker || true
+usermod -aG docker admin
+usermod -aG docker bitcoin
+usermod -aG docker root
+
+# Install Log2Ram
+if [ $IS_RASPI = 1 ] || [ $IS_X86 = 1 ]; then
+    if [ ! -f /usr/local/bin/log2ram ]; then
+        cd /tmp
+        rm -rf log2ram* || true
+        LOG2RAM_UPGRADE_URL=https://github.com/azlux/log2ram/archive/$LOG2RAM_VERSION.tar.gz
+        wget $LOG2RAM_UPGRADE_URL -O log2ram.tar.gz
+        check_app_download log2ram.tar.gz log2ram $LOG2RAM_VERSION "$LOG2RAM_SHA256"
+        tar -xvf log2ram.tar.gz
+        mv log2ram-* log2ram
+        cd log2ram
+        chmod +x install.sh
+        service log2ram stop || true
+        ./install.sh || true
+        cd ~
+    fi
+fi
+
+
+# Remove existing MOTD login info
+rm -rf /etc/motd
+rm -rf /etc/update-motd.d/*
+
+#########################################################
+
+
+# Install Bitcoin
+ARCH="UNKNOWN"
+if [ $IS_RASPI = 1 ]; then
+    ARCH="arm-linux-gnueabihf"
+    if [ $IS_ARM64 = 1 ]; then
+        ARCH="aarch64-linux-gnu"
+    fi
+elif [ $IS_ROCK64 = 1 ] || [ $IS_ROCKPRO64 = 1 ] || [ $IS_ROCKPI4 = 1 ]; then
+    ARCH="aarch64-linux-gnu"
+elif [ $IS_X86 = 1 ]; then
+    ARCH="x86_64-linux-gnu"
+else
+    echo "Unknown Bitcoin Version"
+    exit 1
+fi
+BTC_UPGRADE_URL=https://bitcoincore.org/bin/bitcoin-core-$BTC_VERSION/bitcoin-$BTC_VERSION-$ARCH.tar.gz
+BTC_UPGRADE_SHA256SUM_URL=https://bitcoincore.org/bin/bitcoin-core-$BTC_VERSION/SHA256SUMS
+BTC_UPGRADE_SHA256SUM_ASC_URL=https://bitcoincore.org/bin/bitcoin-core-$BTC_VERSION/SHA256SUMS.asc
+BTC_CLI_COMPLETION_URL=https://raw.githubusercontent.com/bitcoin/bitcoin/v$BTC_VERSION/contrib/completions/bash/bitcoin-cli.bash
+CURRENT=""
+if [ -f $BTC_VERSION_FILE ]; then
+    CURRENT=$(cat $BTC_VERSION_FILE)
+fi
+if [ "$CURRENT" != "$BTC_VERSION" ]; then
+    # Download and install Bitcoin
+    rm -rf /opt/download
+    mkdir -p /opt/download
+    cd /opt/download
+
+    wget $BTC_UPGRADE_URL
+    wget $BTC_UPGRADE_SHA256SUM_URL -O SHA256SUMS
+    wget $BTC_UPGRADE_SHA256SUM_ASC_URL -O SHA256SUMS.asc
+
+    sha256sum --ignore-missing --check SHA256SUMS
+    check_gpg_signer SHA256SUMS.asc SHA256SUMS $BTC_SIGNER_FINGERPRINTS
+
+    # Install Bitcoin
+    tar -xvf bitcoin-$BTC_VERSION-$ARCH.tar.gz
+    mv bitcoin-$BTC_VERSION bitcoin
+    install -m 0755 -o root -g root -t /usr/local/bin bitcoin/bin/*
+    
+    if [ ! -L /home/bitcoin/.bitcoin ]; then
+        sudo -u bitcoin ln -s /mnt/hdd/mynode/bitcoin /home/bitcoin/.bitcoin
+    fi
+    if [ ! -L /home/bitcoin/.lnd ]; then
+        sudo -u bitcoin ln -s /mnt/hdd/mynode/lnd /home/bitcoin/.lnd
+    fi
+    mkdir -p /home/admin/.bitcoin
+    echo $BTC_VERSION > $BTC_VERSION_FILE
+
+    # Install bash-completion for bitcoin-cli
+    wget $BTC_CLI_COMPLETION_URL -O bitcoin-cli.bash
+    sudo cp bitcoin-cli.bash /etc/bash_completion.d/bitcoin-cli
+fi
+cd ~
+
+# Install Lightning
+LND_ARCH="lnd-linux-armv7"
+if [ $IS_X86 = 1 ]; then
+    LND_ARCH="lnd-linux-amd64"
+fi
+if [ $IS_ARM64 = 1 ] || [ $IS_ROCK64 = 1 ] || [ $IS_ROCKPRO64 = 1 ] || [ $IS_ROCKPI4 = 1 ]; then
+    LND_ARCH="lnd-linux-arm64"
+fi
+LND_UPGRADE_URL=https://github.com/lightningnetwork/lnd/releases/download/$LND_VERSION/$LND_ARCH-$LND_VERSION.tar.gz
+LNCLI_COMPLETION_URL=https://raw.githubusercontent.com/lightningnetwork/lnd/$LND_VERSION/contrib/lncli.bash-completion
+
+CURRENT=""
+if [ -f $LND_VERSION_FILE ]; then
+    CURRENT=$(cat $LND_VERSION_FILE)
+fi
+if [ "$CURRENT" != "$LND_VERSION" ]; then
+    rm -rf /opt/download
+    mkdir -p /opt/download
+    cd /opt/download
+
+    wget $LND_UPGRADE_URL
+    wget $LND_UPGRADE_MANIFEST_URL -O manifest.txt
+    wget $LND_UPGRADE_MANIFEST_ROASBEEF_SIG_URL -O manifest_roasbeef.txt.sig || true
+    wget $LND_UPGRADE_MANIFEST_GUGGERO_SIG_URL -O manifest_guggero.txt.sig || true
+    wget $LND_UPGRADE_MANIFEST_SUHEB_SIG_URL -O manifest_suheb.txt.sig || true
+    wget $LND_UPGRADE_MANIFEST_VICTORT_SIG_URL -O manifest_victort.txt.sig || true
+
+    check_gpg_signer manifest_roasbeef.txt.sig manifest.txt $LND_SIGNER_FINGERPRINTS || \
+    check_gpg_signer manifest_guggero.txt.sig manifest.txt $LND_SIGNER_FINGERPRINTS || \
+    check_gpg_signer manifest_suheb.txt.sig manifest.txt $LND_SIGNER_FINGERPRINTS || \
+    check_gpg_signer manifest_victort.txt.sig manifest.txt $LND_SIGNER_FINGERPRINTS
+
+    # Check the download against the signed manifest
+    awk -v f="$LND_ARCH-$LND_VERSION.tar.gz" '$2 == f' manifest.txt | sha256sum --check -
+
+    tar -xzf lnd-*.tar.gz
+    mv $LND_ARCH-$LND_VERSION lnd
+    install -m 0755 -o root -g root -t /usr/local/bin lnd/*
+    ln -s /bin/ip /usr/bin/ip || true
+
+    echo $LND_VERSION > $LND_VERSION_FILE
+
+    # Download bash-completion file for lncli
+    wget $LNCLI_COMPLETION_URL
+    sudo cp lncli.bash-completion /etc/bash_completion.d/lncli
+fi
+cd ~
+
+# Install Loop
+echo "Installing loop..."
+LOOP_ARCH="loop-linux-armv7"
+if [ $IS_X86 = 1 ]; then
+    LOOP_ARCH="loop-linux-amd64"
+fi
+if [ $IS_ARM64 = 1 ]; then
+    LOOP_ARCH="loop-linux-arm64"
+fi
+LOOP_UPGRADE_URL=https://github.com/lightninglabs/loop/releases/download/$LOOP_VERSION/$LOOP_ARCH-$LOOP_VERSION.tar.gz
+CURRENT=""
+if [ -f $LOOP_VERSION_FILE ]; then
+    CURRENT=$(cat $LOOP_VERSION_FILE)
+fi
+if [ "$CURRENT" != "$LOOP_VERSION" ]; then
+    # Download and install Loop
+    rm -rf /opt/download
+    mkdir -p /opt/download
+    cd /opt/download
+
+    wget $LOOP_UPGRADE_URL
+    wget $LOOP_UPGRADE_MANIFEST_URL -O manifest.txt
+    wget $LOOP_UPGRADE_MANIFEST_SIG_URL -O manifest.txt.sig
+
+    check_gpg_signer manifest.txt.sig manifest.txt $LOOP_SIGNER_FINGERPRINTS
+    if [ $? == 0 ]; then
+        # Check the download against the signed manifest
+        awk -v f="$LOOP_ARCH-$LOOP_VERSION.tar.gz" '$2 == f' manifest.txt | sha256sum --check -
+
+        # Install Loop
+        tar -xzf loop-*.tar.gz
+        mv $LOOP_ARCH-$LOOP_VERSION loop
+        install -m 0755 -o root -g root -t /usr/local/bin loop/*
+
+        # Mark current version
+        echo $LOOP_VERSION > $LOOP_VERSION_FILE
+    else
+        echo "ERROR UPGRADING LND - GPG FAILED"
+    fi
+fi
+
+# Install Pool
+echo "Installing pool..."
+POOL_ARCH="pool-linux-armv7"
+if [ $IS_X86 = 1 ]; then
+    POOL_ARCH="pool-linux-amd64"
+fi
+if [ $IS_ARM64 = 1 ]; then
+    POOL_ARCH="pool-linux-arm64"
+fi
+POOL_UPGRADE_URL=https://github.com/lightninglabs/pool/releases/download/$POOL_VERSION/$POOL_ARCH-$POOL_VERSION.tar.gz
+CURRENT=""
+if [ -f $POOL_VERSION_FILE ]; then
+    CURRENT=$(cat $POOL_VERSION_FILE)
+fi
+if [ "$CURRENT" != "$POOL_VERSION" ]; then
+    # Download and install pool
+    rm -rf /opt/download
+    mkdir -p /opt/download
+    cd /opt/download
+
+    wget $POOL_UPGRADE_URL
+    wget $POOL_UPGRADE_MANIFEST_URL -O manifest.txt
+    wget $POOL_UPGRADE_MANIFEST_SIG_URL -O manifest.txt.sig
+
+    check_gpg_signer manifest.txt.sig manifest.txt $POOL_SIGNER_FINGERPRINTS
+    if [ $? == 0 ]; then
+        # Check the download against the signed manifest
+        awk -v f="$POOL_ARCH-$POOL_VERSION.tar.gz" '$2 == f' manifest.txt | sha256sum --check -
+
+        # Install Pool
+        tar -xzf pool-*.tar.gz
+        mv $POOL_ARCH-$POOL_VERSION pool
+        install -m 0755 -o root -g root -t /usr/local/bin pool/*
+
+        # Mark current version
+        echo $POOL_VERSION > $POOL_VERSION_FILE
+    else
+        echo "ERROR UPGRADING POOL - GPG FAILED"
+    fi
+fi
+
+# Install Lightning Terminal
+echo "Installing lit..."
+LIT_ARCH="lightning-terminal-linux-armv7"
+if [ $IS_X86 = 1 ]; then
+    LIT_ARCH="lightning-terminal-linux-amd64"
+fi
+if [ $IS_ARM64 = 1 ]; then
+    LIT_ARCH="lightning-terminal-linux-arm64"
+fi
+LIT_UPGRADE_URL=https://github.com/lightninglabs/lightning-terminal/releases/download/$LIT_VERSION/$LIT_ARCH-$LIT_VERSION.tar.gz
+CURRENT=""
+if [ -f $LIT_VERSION_FILE ]; then
+    CURRENT=$(cat $LIT_VERSION_FILE)
+fi
+# Also install when frcli is missing (devices with LiT from before it was installed)
+if [ "$CURRENT" != "$LIT_VERSION" ] || [ ! -f /usr/local/bin/frcli ]; then
+    # Download and install lit
+    rm -rf /opt/download
+    mkdir -p /opt/download
+    cd /opt/download
+
+    wget $LIT_UPGRADE_URL
+    wget $LIT_UPGRADE_MANIFEST_URL -O manifest.txt
+    wget $LIT_UPGRADE_MANIFEST_ROASBEEF_SIG_URL -O manifest_roasbeef.txt.sig || true
+    wget $LIT_UPGRADE_MANIFEST_VIKTORT_SIG_URL -O manifest_viktort.txt.sig || true
+
+    check_gpg_signer manifest_roasbeef.txt.sig manifest.txt $LIT_SIGNER_FINGERPRINTS || \
+    check_gpg_signer manifest_viktort.txt.sig manifest.txt $LIT_SIGNER_FINGERPRINTS
+    if [ $? == 0 ]; then
+        # Check the download against the signed manifest
+        awk -v f="$LIT_ARCH-$LIT_VERSION.tar.gz" '$2 == f' manifest.txt | sha256sum --check -
+
+        # Install lit
+        tar -xzf lightning-terminal-*.tar.gz
+        mv $LIT_ARCH-$LIT_VERSION lightning-terminal
+        install -m 0755 -o root -g root -t /usr/local/bin lightning-terminal/lit* lightning-terminal/frcli
+
+        # Mark current version
+        echo $LIT_VERSION > $LIT_VERSION_FILE
+    else
+        echo "ERROR UPGRADING LIT - GPG FAILED"
+    fi
+fi
+cd ~
+
+# Upgrade Lightning Chantools
+echo "Upgrading chantools..."
+CHANTOOLS_ARCH="chantools-linux-armv7"
+if [ $IS_X86 = 1 ]; then
+    CHANTOOLS_ARCH="chantools-linux-amd64"
+fi
+if [ $IS_ARM64 = 1 ]; then
+    CHANTOOLS_ARCH="chantools-linux-arm64"
+fi
+CHANTOOLS_UPGRADE_URL=https://github.com/lightninglabs/chantools/releases/download/$CHANTOOLS_VERSION/$CHANTOOLS_ARCH-$CHANTOOLS_VERSION.tar.gz
+CURRENT=""
+if [ -f $CHANTOOLS_VERSION_FILE ]; then
+    CURRENT=$(cat $CHANTOOLS_VERSION_FILE)
+fi
+if [ "$CURRENT" != "$CHANTOOLS_VERSION" ]; then
+    # Download and install lit
+    rm -rf /opt/download
+    mkdir -p /opt/download
+    cd /opt/download
+
+    wget $CHANTOOLS_UPGRADE_URL
+    wget $CHANTOOLS_UPGRADE_MANIFEST_URL -O manifest.txt
+    wget $CHANTOOLS_UPGRADE_MANIFEST_SIG_URL  -O manifest.txt.sig
+
+    check_gpg_signer manifest.txt.sig manifest.txt $CHANTOOLS_SIGNER_FINGERPRINTS
+    if [ $? == 0 ]; then
+        # Check the download against the signed manifest
+        awk -v f="$CHANTOOLS_ARCH-$CHANTOOLS_VERSION.tar.gz" '$2 == f' manifest.txt | sha256sum --check -
+
+        # Install lit
+        tar -xzf chantools-*.tar.gz
+        mv $CHANTOOLS_ARCH-$CHANTOOLS_VERSION chantools
+        install -m 0755 -o root -g root -t /usr/local/bin chantools/chantools
+
+        # Mark current version
+        echo $CHANTOOLS_VERSION > $CHANTOOLS_VERSION_FILE
+    else
+        echo "ERROR UPGRADING CHANTOOLS - GPG FAILED"
+    fi
+fi
+cd ~
+
+
+# Setup "install" location for some apps
+mkdir -p /opt/mynode
+chown -R bitcoin:bitcoin /opt/mynode
+
+
+# Install LND Hub
+# Skip - no longer default app
+
+# Install Caravan
+# Skip - no longer default app
+
+
+# Install cors proxy (mynode fork)
+CORSPROXY_UPGRADE_URL=https://github.com/mynodebtc/CORS-Proxy/archive/$CORSPROXY_VERSION.tar.gz
+CURRENT=""
+if [ -f $CORSPROXY_VERSION_FILE ]; then
+    CURRENT=$(cat $CORSPROXY_VERSION_FILE)
+fi
+if [ "$CURRENT" != "$CORSPROXY_VERSION" ]; then
+    cd /opt/mynode
+    rm -rf corsproxy
+
+    rm -f corsproxy.tar.gz
+    wget $CORSPROXY_UPGRADE_URL -O corsproxy.tar.gz
+    check_app_download corsproxy.tar.gz corsproxy $CORSPROXY_VERSION "$CORSPROXY_SHA256"
+    tar -xzf corsproxy.tar.gz
+    rm -f corsproxy.tar.gz
+    mv CORS-* corsproxy
+
+    cd corsproxy
+    npm install
+    echo $CORSPROXY_VERSION > $CORSPROXY_VERSION_FILE
+fi
+cd ~
+
+
+# Install Electrs (just mark version, now included in overlay)
+echo $ELECTRS_VERSION > $ELECTRS_VERSION_FILE
+
+
+#echo "Installing JoinInBox..."
+# No longer a default app
+
+# Install RTL
+RTL_UPGRADE_URL=https://github.com/Ride-The-Lightning/RTL/archive/$RTL_VERSION.tar.gz
+RTL_UPGRADE_ASC_URL=https://github.com/Ride-The-Lightning/RTL/releases/download/$RTL_VERSION/$RTL_VERSION.tar.gz.asc
+CURRENT=""
+if [ -f $RTL_VERSION_FILE ]; then
+    CURRENT=$(cat $RTL_VERSION_FILE)
+fi
+if [ "$CURRENT" != "$RTL_VERSION" ]; then
+    cd /opt/mynode
+    rm -rf RTL
+
+    sudo -u bitcoin wget $RTL_UPGRADE_URL -O RTL.tar.gz
+    sudo -u bitcoin wget $RTL_UPGRADE_ASC_URL -O RTL.tar.gz.asc
+
+    check_gpg_signer RTL.tar.gz.asc RTL.tar.gz $RTL_SIGNER_FINGERPRINTS
+
+    sudo -u bitcoin tar -xvf RTL.tar.gz
+    sudo -u bitcoin rm RTL.tar.gz RTL.tar.gz.asc
+    sudo -u bitcoin mv RTL-* RTL
+    cd RTL
+    sudo -u bitcoin NG_CLI_ANALYTICS=false npm install --omit=dev --legacy-peer-deps
+
+    echo $RTL_VERSION > $RTL_VERSION_FILE
+fi
+
+
+# Install BTC RPC Explorer
+BTCRPCEXPLORER_UPGRADE_URL=https://github.com/janoside/btc-rpc-explorer/archive/$BTCRPCEXPLORER_VERSION.tar.gz
+CURRENT=""
+if [ -f $BTCRPCEXPLORER_VERSION_FILE ]; then
+    CURRENT=$(cat $BTCRPCEXPLORER_VERSION_FILE)
+fi
+if [ "$CURRENT" != "$BTCRPCEXPLORER_VERSION" ]; then
+    cd /opt/mynode
+    rm -rf btc-rpc-explorer
+    sudo -u bitcoin wget $BTCRPCEXPLORER_UPGRADE_URL -O btc-rpc-explorer.tar.gz
+    check_app_download btc-rpc-explorer.tar.gz btcrpcexplorer $BTCRPCEXPLORER_VERSION "$BTCRPCEXPLORER_SHA256"
+    sudo -u bitcoin tar -xvf btc-rpc-explorer.tar.gz
+    sudo -u bitcoin rm btc-rpc-explorer.tar.gz
+    sudo -u bitcoin mv btc-rpc-* btc-rpc-explorer
+    cd btc-rpc-explorer
+    sudo -u bitcoin npm install --omit=dev
+
+    echo $BTCRPCEXPLORER_VERSION > $BTCRPCEXPLORER_VERSION_FILE
+fi
+
+
+# Install Thunderhub
+THUNDERHUB_UPGRADE_URL=https://github.com/apotdevin/thunderhub/archive/$THUNDERHUB_VERSION.tar.gz
+CURRENT=""
+if [ -f $THUNDERHUB_VERSION_FILE ]; then
+    CURRENT=$(cat $THUNDERHUB_VERSION_FILE)
+fi
+if [ "$CURRENT" != "$THUNDERHUB_VERSION" ]; then
+    cd /opt/mynode
+    rm -rf thunderhub
+    sudo -u bitcoin wget $THUNDERHUB_UPGRADE_URL -O thunderhub.tar.gz
+    check_app_download thunderhub.tar.gz thunderhub $THUNDERHUB_VERSION "$THUNDERHUB_SHA256"
+    sudo -u bitcoin tar -xvf thunderhub.tar.gz
+    sudo -u bitcoin rm thunderhub.tar.gz
+    sudo -u bitcoin mv thunderhub-* thunderhub
+    cd thunderhub
+
+    sudo -u bitcoin npm install # --omit=dev # (can't build without dev dependencies)
+    sudo -u bitcoin npm run build
+    sudo -u bitcoin npx --yes next telemetry disable || true
+
+    # Setup symlink to service files
+    rm -f /opt/mynode/thunderhub/.env.local
+    sudo ln -s /mnt/hdd/mynode/thunderhub/.env.local /opt/mynode/thunderhub/.env.local
+
+    echo $THUNDERHUB_VERSION > $THUNDERHUB_VERSION_FILE
+fi
+
+
+# Install LND Connect
+LNDCONNECTARCH="lndconnect-linux-armv7"
+LNDCONNECT_SHA256="$LNDCONNECT_ARMV7_SHA256"
+if [ $IS_X86 = 1 ]; then
+    LNDCONNECTARCH="lndconnect-linux-amd64"
+    LNDCONNECT_SHA256="$LNDCONNECT_AMD64_SHA256"
+fi
+LNDCONNECT_UPGRADE_URL=https://github.com/LN-Zap/lndconnect/releases/download/v0.2.0/$LNDCONNECTARCH-$LNDCONNECT_VERSION.tar.gz
+CURRENT=""
+if [ -f $LNDCONNECT_VERSION_FILE ]; then
+    CURRENT=$(cat $LNDCONNECT_VERSION_FILE)
+fi
+if [ "$CURRENT" != "$LNDCONNECT_VERSION" ]; then
+    rm -rf /opt/download
+    mkdir -p /opt/download
+    cd /opt/download
+    wget $LNDCONNECT_UPGRADE_URL -O lndconnect.tar.gz
+    check_app_download lndconnect.tar.gz lndconnect $LNDCONNECT_VERSION "$LNDCONNECT_SHA256"
+    tar -xvf lndconnect.tar.gz
+    rm lndconnect.tar.gz
+    mv lndconnect-* lndconnect
+    install -m 0755 -o root -g root -t /usr/local/bin lndconnect/*
+
+    echo $LNDCONNECT_VERSION > $LNDCONNECT_VERSION_FILE
+fi
+
+
+# Tor remote access is off by default on new installs
+touch /home/bitcoin/.mynode/tor_remote_access_disabled
+
+# Make sure "Remote Access" apps are marked installed
+touch /home/bitcoin/.mynode/install_tor
+touch /home/bitcoin/.mynode/install_premium_plus
+touch /home/bitcoin/.mynode/install_vpn
+
+# Mark docker images for install (on SD so install occurs after drive attach)
+touch /home/bitcoin/.mynode/install_mempool
+touch /home/bitcoin/.mynode/install_btcpayserver
+
+# SKIPPING SPECTER - OPTIONAL APP
+# SKIPPING LNBITS - OPTIONAL APP
+# SKIPPING CKBUNKER - OPTIONAL APP
+# SKIPPING SPHINX - OPTIONAL APP
+# SKIPPING BOS - OPTIONAL APP
+# SKIPPING PYBLOCK - OPTIONAL APP
+# SKIPPING WARDEN - OPTIONAL APP
+
+
+# Make sure we are using legacy iptables
+update-alternatives --set iptables /usr/sbin/iptables-legacy || true
+update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy || true
+
+
+#########################################################
+
+
+# Install files (downloaded and extracted earlier)
+rsync -r -K /tmp/upgrade/out/rootfs_*/* /
+sync
+sleep 1
+
+# Initialize users again, now that the installed files are in place
+/usr/bin/mynode_initialize_users.sh
+
+# Use MyNode's nginx config, which loads the modules its sites need
+cp -f /usr/share/mynode/nginx.conf /etc/nginx/nginx.conf
+
+# Build the venvs for the web UI and Glances (64-bit only)
+source /usr/share/mynode/mynode_functions.sh
+if has_app_python; then
+    # The web UI and MyNode's scripts use the root Python until this venv is built
+    if ! build_www_venv; then
+        echo "WARNING: Failed to build the venv for the web UI"
+    fi
+    # Glances runs from its own venv (glances.service does not start without it)
+    if build_root_venv glances "import glances"; then
+        ln -sfn /usr/local/lib/mynode/venv/glances/bin/glances /usr/local/bin/glances
+    else
+        echo "WARNING: Failed to install Glances"
+    fi
+fi
+
+
+# Mark dynamic applications as default application
+# ... (none yet)
+
+# Upgrade Dynamic Applications (must be done after file installation)
+# mynode-manage-apps upgrade # not yet working during setup process
+
+
+# Enable fan control
+if [ $IS_ROCKPRO64 = 1 ]; then
+    systemctl enable fan_control
+fi
+
+# Random Cleanup
+rm -rf /opt/download
+mkdir -p /opt/download
+
+# Clean apt-cache
+apt-get clean
+
+# Setup MyNode Startup Script
+systemctl daemon-reload
+systemctl enable check_in
+systemctl enable mynode_auto_upgrade.timer
+systemctl enable premium_plus_connect
+systemctl enable background
+systemctl enable docker
+systemctl enable mynode
+systemctl enable firewall
+systemctl enable www
+systemctl enable drive_check
+systemctl enable bitcoin
+systemctl enable seed_bitcoin_peers
+systemctl enable lnd
+systemctl enable loop
+systemctl enable pool
+systemctl enable lit
+#systemctl enable lnd_unlock # NOT NECESSARY WITH LND 0.13+
+systemctl enable lnd_backup
+systemctl enable lnd_admin_files
+systemctl enable lndconnect
+systemctl enable redis-server
+#systemctl enable mongodb
+#systemctl enable electrs # DISABLED BY DEFAULT
+#systemctl enable lndhub # DISABLED BY DEFAULT
+systemctl disable i2pd # Started when Bitcoin uses I2P
+#systemctl enable btcrpcexplorer # DISABLED BY DEFAULT
+systemctl enable rtl
+systemctl enable tor
+systemctl enable invalid_block_check
+systemctl enable docker_images
+systemctl enable glances
+#systemctl enable netdata # DISABLED BY DEFAULT
+systemctl enable rotate_logs
+systemctl enable corsproxy_btcrpc
+systemctl enable usb_extras
+
+
+# Disable services
+systemctl disable hitch || true
+systemctl disable mongodb || true
+systemctl disable dhcpcd || true
+systemctl disable dphys-swapfile || true
+
+# QuickSync has been removed - stop seeding / downloading and remove its services
+for QS_SERVICE in quicksync bandwidth torrent_check; do
+    systemctl stop $QS_SERVICE || true
+    systemctl disable $QS_SERVICE || true
+    rm -f /etc/systemd/system/$QS_SERVICE.service || true
+done
+apt-get -y purge transmission-cli || true
+
+
+# Delete junk
+rm -rf /home/admin/download
+rm -rf /home/admin/.bash_history
+rm -rf /home/bitcoin/.bash_history
+rm -rf /root/.bash_history
+rm -rf /root/.ssh/known_hosts
+rm -rf /etc/resolv.conf
+rm -rf /tmp/*
+rm -rf ~/setup_device.sh
+rm -rf /etc/motd # Remove simple motd for update-motd.d
+
+# Remove default debian stuff
+deluser mynode || true
+rm -rf /home/mynode || true
+
+# Remove default Pi stuff
+deluser pi || true
+rm -rf /home/pi || true
+
+# Regenerate MAC address for some Armbian devices
+if [ $IS_ROCK64 = 1 ] || [ $IS_ROCKPRO64 = 1 ] ; then
+    . /usr/lib/armbian/armbian-common
+    CONNECTION="$(nmcli -f UUID,ACTIVE,DEVICE,TYPE connection show --active | tail -n1)"
+    UUID=$(awk -F" " '/ethernet/ {print $1}' <<< "${CONNECTION}")
+    get_random_mac
+    nmcli connection modify $UUID ethernet.cloned-mac-address $MACADDR
+    nmcli connection modify $UUID -ethernet.mac-address ""
+fi
+
+# Add fsck force to startup for x86
+if [ $IS_X86 = 1 ]; then
+    sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\"quiet fsck.mode=force fsck.repair=yes\"/g" /etc/default/grub
+    update-grub
+fi
+
+# Add generic boot option if UEFI
+if [ -f /boot/efi/EFI/debian/grubx64.efi ]; then
+    mkdir -p /boot/efi/EFI/BOOT
+    cp -f /boot/efi/EFI/debian/grubx64.efi /boot/efi/EFI/BOOT/bootx64.efi
+fi
+
+sync
+
+set +x
+echo ""
+echo ""
+echo "##################################"
+echo "          SETUP COMPLETE          "
+echo "   Reboot your device to begin!   "
+echo "##################################"
+echo ""
+echo ""
+
+### MAKE IMAGE NOW ###
+# This prevents auto gen files like certs to be part of the base image
+# Must make sure image can boot after this point and fully come up
